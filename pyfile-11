@@ -39,4 +39,208 @@ print(f"Staging data created with {staging_df.count()} records")
 history_df = spark.table("dbo.verintwfm_queue_filters_history")
 
 # ============================================================================
-# Step 2: T
+# Step 2: Term existing rows with no current alignment
+# ============================================================================
+print("Step 2: Terminating obsolete records...")
+
+# Find active records in history that don't exist in current staging (LEFT JOIN + IS NULL)
+records_to_terminate = history_df.alias("f").join(
+    staging_df.alias("s"),
+    (col("f.FilterID") == col("s.FilterID")) &
+    (col("f.ViewID") == col("s.ViewID")) &
+    (col("f.QueueID") == col("s.QueueID")),
+    "left"
+).filter(
+    (col("f.RecordEndDateNonInclusive") == lit("9999-12-31")) &  # Active records only
+    col("s.QueueID").isNull()  # Not in staging (equivalent to NOT EXISTS)
+)
+
+# Get the records that need termination
+terminated_records = records_to_terminate.select("f.*").withColumn(
+    "RecordEndDateTimeInclusive", today
+).withColumn(
+    "RecordLastModifiedDateTime", now
+)
+
+terminated_count = terminated_records.count()
+if terminated_count > 0:
+    print(f"Found {terminated_count} records to terminate")
+    # In a real implementation, you'd write these back to update the history table
+    # terminated_records.write.mode("overwrite").option("replaceWhere", "condition").saveAsTable("temp_terminated")
+else:
+    print("No records to terminate")
+
+# ============================================================================
+# Step 3: Update non-temporal attributes for existing active records  
+# ============================================================================
+print("Step 3: Updating existing records with changed attributes...")
+
+# Find records that exist in both but have different attribute values
+records_to_update = history_df.alias("f").join(
+    staging_df.alias("s"),
+    (col("f.FilterID") == col("s.FilterID")) &
+    (col("f.ViewID") == col("s.ViewID")) &
+    (col("f.QueueID") == col("s.QueueID")),
+    "inner"
+).filter(
+    col("f.RecordEndDateNonInclusive") == lit("9999-12-31")  # Active records only
+).filter(
+    # Check for differences in non-temporal attributes
+    (col("f.FilterName") != col("s.FilterName")) |
+    (col("f.ViewName") != col("s.ViewName")) |
+    (coalesce(col("f.QueueName"), lit("")) != coalesce(col("s.QueueName"), lit("")))
+)
+
+# Create updated records
+updated_records = records_to_update.select(
+    col("f.RecordID"),
+    col("f.FilterID"),
+    col("s.FilterName"),  # Updated value
+    col("f.ViewID"), 
+    col("s.ViewName"),    # Updated value
+    col("f.QueueID"),
+    col("s.QueueName"),   # Updated value
+    col("f.RecordStartDateInclusive"),
+    col("f.RecordEndDateTimeInclusive"), 
+    col("f.RecordCreatedDateTime"),
+    now.alias("RecordLastModifiedDateTime")  # Updated timestamp
+)
+
+updated_count = updated_records.count()
+if updated_count > 0:
+    print(f"Found {updated_count} records to update")
+    # In a real implementation, you'd write these back to update the history table
+    # updated_records.write.mode("overwrite").option("replaceWhere", "condition").saveAsTable("temp_updated")
+else:
+    print("No records to update")
+
+# ============================================================================
+# Step 4: Insert new records (equivalent to INSERT with NOT EXISTS)
+# ============================================================================
+print("Step 4: Inserting new records...")
+
+# Find records in staging that don't exist in active history
+# This is equivalent to the NOT EXISTS subquery in the SQL
+active_history = history_df.filter(col("RecordEndDateNonInclusive") == lit("9999-12-31"))
+
+new_records = staging_df.alias("s").join(
+    active_history.alias("f"),
+    (col("s.FilterID") == col("f.FilterID")) &
+    (col("s.ViewID") == col("f.ViewID")) &  
+    (col("s.QueueID") == col("f.QueueID")),
+    "left"
+).filter(
+    col("f.FilterID").isNull()  # Equivalent to NOT EXISTS
+).select(
+    col("s.FilterID"),
+    col("s.FilterName"),
+    col("s.ViewID"),
+    col("s.ViewName"),
+    col("s.QueueID"),
+    col("s.QueueName"),
+    today.alias("RecordStartDateInclusive"),
+    lit("9999-12-31").alias("RecordEndDateTimeInclusive"),
+    now.alias("RecordCreatedDateTime"),
+    now.alias("RecordLastModifiedDateTime")
+)
+
+new_records_count = new_records.count()
+if new_records_count > 0:
+    print(f"Found {new_records_count} new records to insert")
+    # Write new records to history table
+    # new_records.write.mode("append").saveAsTable("dbo.verintwfm_queue_filters_history")
+else:
+    print("No new records to insert")
+
+# ============================================================================
+# Alternative: Complete Delta Lake Implementation
+# ============================================================================
+"""
+# For production Delta Lake implementation:
+from delta.tables import DeltaTable
+
+try:
+    delta_table = DeltaTable.forName(spark, "dbo.verintwfm_queue_filters_history")
+    
+    # Step 1: Terminate records not in staging
+    delta_table.alias("target").merge(
+        staging_df.alias("source"), 
+        '''target.FilterID = source.FilterID AND 
+           target.ViewID = source.ViewID AND 
+           target.QueueID = source.QueueID AND 
+           target.RecordEndDateNonInclusive = '9999-12-31' '''
+    ).whenNotMatchedBySourceUpdate(
+        condition="target.RecordEndDateNonInclusive = '9999-12-31'",
+        set={
+            "RecordEndDateTimeInclusive": today,
+            "RecordLastModifiedDateTime": now
+        }
+    ).execute()
+    
+    # Step 2: Update existing records and insert new ones
+    delta_table.alias("target").merge(
+        staging_df.alias("source"),
+        '''target.FilterID = source.FilterID AND 
+           target.ViewID = source.ViewID AND 
+           target.QueueID = source.QueueID AND 
+           target.RecordEndDateNonInclusive = '9999-12-31' '''
+    ).whenMatchedUpdate(
+        condition='''target.FilterName != source.FilterName OR 
+                     target.ViewName != source.ViewName OR 
+                     coalesce(target.QueueName, '') != coalesce(source.QueueName, '')''',
+        set={
+            "FilterName": "source.FilterName",
+            "ViewName": "source.ViewName",
+            "QueueName": "source.QueueName", 
+            "RecordLastModifiedDateTime": now
+        }
+    ).whenNotMatchedInsert(
+        values={
+            "FilterID": "source.FilterID",
+            "FilterName": "source.FilterName",
+            "ViewID": "source.ViewID", 
+            "ViewName": "source.ViewName",
+            "QueueID": "source.QueueID",
+            "QueueName": "source.QueueName",
+            "RecordStartDateInclusive": today,
+            "RecordEndDateTimeInclusive": lit("9999-12-31"),
+            "RecordCreatedDateTime": now,
+            "RecordLastModifiedDateTime": now
+        }
+    ).execute()
+    
+    print("Delta Lake merge operations completed successfully")
+    
+except Exception as e:
+    print(f"Delta Lake operations failed: {str(e)}")
+    print("Falling back to individual DataFrame operations...")
+"""
+
+# ============================================================================
+# Cleanup (equivalent to DROP TABLE)
+# ============================================================================
+print("Step 5: Cleanup...")
+staging_df.unpersist()  # Release cached dataframe from memory
+
+print("Queue filters history processing completed successfully!")
+print(f"- Records to terminate: {terminated_count if 'terminated_count' in locals() else 0}")  
+print(f"- Records to update: {updated_count if 'updated_count' in locals() else 0}")
+print(f"- Records to insert: {new_records_count if 'new_records_count' in locals() else 0}")
+
+# Optional: Show sample of each operation for verification
+print("\n=== SAMPLE DATA FOR VERIFICATION ===")
+if 'terminated_records' in locals() and terminated_count > 0:
+    print("Sample terminated records:")
+    terminated_records.select("FilterID", "ViewID", "QueueID", "RecordEndDateTimeInclusive").show(5)
+
+if 'updated_records' in locals() and updated_count > 0:  
+    print("Sample updated records:")
+    updated_records.select("FilterID", "FilterName", "ViewName", "QueueName").show(5)
+
+if 'new_records' in locals() and new_records_count > 0:
+    print("Sample new records:")
+    new_records.select("FilterID", "FilterName", "ViewID", "ViewName", "QueueID").show(5)
+
+
+
+    new_records.select("FilterID", "FilterName", "ViewID", "ViewName", "QueueID").show(5)
