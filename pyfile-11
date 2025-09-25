@@ -1,0 +1,42 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from datetime import datetime, date
+
+# Initialize Spark session
+spark = SparkSession.builder.appName("QueueFiltersHistory").getOrCreate()
+
+# Set current datetime and date (equivalent to SQL @now and @today variables)
+now = current_timestamp()  # Equivalent to GETDATE()
+today = current_date()     # Equivalent to GETDATE() for date only
+
+# Step 1: Create staging dataframe (equivalent to temp table #t_verintwfm_queue_filters)
+print("Step 1: Creating staging data...")
+
+# Read source tables
+queue_filters_df = spark.table("dbo.verintwfm_queue_filters")
+queue_df = spark.table("dbo.verintwfm_queue")
+
+# Create staging dataframe with LEFT JOIN (equivalent to temp table population)
+staging_df = queue_filters_df.alias("qf").join(
+    queue_df.alias("q"),
+    col("qf.QueueID") == col("q.QueueID"),
+    "left"
+).select(
+    col("qf.FilterID"),
+    col("qf.FilterName"), 
+    col("qf.ViewID"),
+    col("qf.ViewName"),
+    col("qf.QueueID"),
+    col("q.QueueName")
+)
+
+# Cache staging data for multiple operations
+staging_df.cache()
+print(f"Staging data created with {staging_df.count()} records")
+
+# Read the history table
+history_df = spark.table("dbo.verintwfm_queue_filters_history")
+
+# ============================================================================
+# Step 2: T
