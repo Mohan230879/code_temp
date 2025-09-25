@@ -1,0 +1,148 @@
+from pyspark.sql import SparkSession
+import logging
+import sys
+
+# -------------------------------------------------------------------
+# Initialize logging
+# -------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+def main():
+    # -------------------------------------------------------------------
+    # Create Spark Session
+    # -------------------------------------------------------------------
+    try:
+        spark = SparkSession.builder \
+            .appName("VerintWFMQueueFiltersSync") \
+            .enableHiveSupport() \
+            .getOrCreate()
+        logging.info(f"Spark Session created successfully (App ID: {spark.sparkContext.applicationId})")
+    except Exception as e:
+        logging.error(f"Error creating Spark Session: {e}")
+        sys.exit(1)
+
+    try:
+        # -------------------------------------------------------------------
+        # Variables for current timestamp and date
+        # -------------------------------------------------------------------
+        now = spark.sql("SELECT current_timestamp()").collect()[0][0]
+        today = spark.sql("SELECT current_date()").collect()[0][0]
+
+        logging.info("Starting synchronization process...")
+
+        # -------------------------------------------------------------------
+        # 1. Create temporary view (Source + Lookup)
+        # -------------------------------------------------------------------
+        spark.sql("""
+            CREATE OR REPLACE TEMP VIEW t_verintwfm_queue_filters AS
+            SELECT
+                qf.FilterID,
+                qf.FilterName,
+                qf.ViewID,
+                qf.ViewName,
+                qf.QueueID,
+                q.QueueName
+            FROM gdp_dev.reporting.verintwfm_queue_filters qf
+            LEFT OUTER JOIN gdp_dev.reporting.verintwfm_queue q
+                ON qf.QueueID = q.QueueID
+        """)
+        logging.info("Created temporary view 't_verintwfm_queue_filters'.")
+
+        # -------------------------------------------------------------------
+        # 2. Terminate old rows (end-date)
+        # -------------------------------------------------------------------
+        spark.sql(f"""
+            UPDATE gdp_dev.reporting.verintwfm_queue_filters_history f
+            SET RecordEndDateNonInclusive = DATE('{today}'),
+                RecordLastModifiedDateTime = TIMESTAMP('{now}')
+            WHERE RecordEndDateNonInclusive = DATE('9999-12-31')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM t_verintwfm_queue_filters s
+                  WHERE f.FilterID = s.FilterID
+                    AND f.ViewID   = s.ViewID
+                    AND f.QueueID  = s.QueueID
+              )
+        """)
+        logging.info("Terminated old records that no longer exist in the source.")
+
+        # -------------------------------------------------------------------
+        # 3. Update non-temporal attributes
+        # -------------------------------------------------------------------
+        spark.sql(f"""
+            UPDATE gdp_dev.reporting.verintwfm_queue_filters_history f
+            SET f.FilterName = s.FilterName,
+                f.ViewName   = s.ViewName,
+                f.QueueName  = s.QueueName,
+                f.RecordLastModifiedDateTime = TIMESTAMP('{now}')
+            FROM t_verintwfm_queue_filters s
+            WHERE f.FilterID = s.FilterID
+              AND f.ViewID   = s.ViewID
+              AND f.QueueID  = s.QueueID
+              AND (
+                    f.FilterName <> s.FilterName
+                 OR f.ViewName   <> s.ViewName
+                 OR COALESCE(f.QueueName,'') <> COALESCE(s.QueueName,'')
+              )
+              AND f.RecordEndDateNonInclusive = DATE('9999-12-31')
+        """)
+        logging.info("Updated non-temporal attributes for current records.")
+
+        # -------------------------------------------------------------------
+        # 4. Insert new rows
+        # -------------------------------------------------------------------
+        spark.sql(f"""
+            INSERT INTO gdp_dev.reporting.verintwfm_queue_filters_history (
+                FilterID,
+                FilterName,
+                ViewID,
+                ViewName,
+                QueueID,
+                QueueName,
+                RecordStartDateInclusive,
+                RecordEndDateNonInclusive,
+                RecordCreatedDateTime,
+                RecordLastModifiedDateTime
+            )
+            SELECT
+                s.FilterID,
+                s.FilterName,
+                s.ViewID,
+                s.ViewName,
+                s.QueueID,
+                s.QueueName,
+                DATE('{today}')   AS RecordStartDateInclusive,
+                DATE('9999-12-31') AS RecordEndDateNonInclusive,
+                TIMESTAMP('{now}') AS RecordCreatedDateTime,
+                TIMESTAMP('{now}') AS RecordLastModifiedDateTime
+            FROM t_verintwfm_queue_filters s
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM gdp_dev.reporting.verintwfm_queue_filters_history f
+                WHERE s.FilterID = f.FilterID
+                  AND s.ViewID   = f.ViewID
+                  AND s.QueueID  = f.QueueID
+                  AND f.RecordEndDateNonInclusive = DATE('9999-12-31')
+            )
+        """)
+        logging.info("Inserted new records into the history table.")
+
+        # -------------------------------------------------------------------
+        # 5. Cleanup
+        # -------------------------------------------------------------------
+        spark.sql("DROP VIEW IF EXISTS t_verintwfm_queue_filters")
+        logging.info("Dropped temporary view 't_verintwfm_queue_filters'.")
+        logging.info("Synchronization process completed successfully.")
+
+    except Exception as e:
+        logging.error(f"Error during synchronization process: {e}")
+    finally:
+        spark.stop()
+        logging.info("Spark Session stopped.")
+
+
+if __name__ == "__main__":
+    main()
