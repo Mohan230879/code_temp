@@ -1,0 +1,124 @@
+import logging
+import json
+import sys
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from datetime import datetime
+
+# -------------------------------------------------------------------
+#  Setup logging
+# -------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(_name_)
+
+
+# -------------------------------------------------------------------
+#  Helper function to build fully qualified table names
+# -------------------------------------------------------------------
+def build_qualified(catalog, schema, table):
+    """Return fully qualified table name"""
+    if catalog:
+        return f"{catalog}.{schema}.{table}"
+    return f"{schema}.{table}"
+
+
+# -------------------------------------------------------------------
+#  Create the stage dataframe with joins
+# -------------------------------------------------------------------
+def create_stage_df(spark, qualified_source_schema):
+    query = f"""
+        SELECT 
+            QAD.ID AS FilterID,
+            QAD.NAME AS FilterName,
+            QADD.ID AS ViewID,
+            QADD.VALUE AS ViewName,
+            Q.ID AS QueueID
+        FROM {qualified_source_schema}.QUEUEATTRIBUTDEFINITION QAD
+        INNER JOIN {qualified_source_schema}.QUEUEATTRIBUTETYPE QAT
+            ON QAD.QUEUEATTRIBUTETYPEID = QAT.ID
+        INNER JOIN {qualified_source_schema}.QUEUEATTRIBUTEPAIRVALUE QAPVDD
+            ON QAD.ID = QAPVDD.QUEUEATTRIBUTEID
+        INNER JOIN {qualified_source_schema}.QUEUEATTRIBUTEDROPDOWN QADD
+            ON QAPVDD.VALUE = QADD.ID
+            AND QAPVDD.QUEUEATTRIBUTEID = QADD.QUEUEATTRIBUTEID
+        INNER JOIN {qualified_source_schema}.QUEUE Q
+            ON QAPVDD.QUEUEATTRIBUTEID = Q.ID
+    """
+    logger.info("Executing stage query...")
+    return spark.sql(query)
+
+
+# -------------------------------------------------------------------
+#  Main PySpark job
+# -------------------------------------------------------------------
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if not argv:
+        logger.error("Please provide JSON parameters for source/target tables.")
+        sys.exit(1)
+
+    # Parse parameters from JSON input
+    params = json.loads(argv[0]) if isinstance(argv[0], str) else argv[0]
+
+    spark = SparkSession.builder.appName("paspark_job").getOrCreate()
+
+    target_catalog = params.get("target_catalog_name", "")
+    target_schema = params.get("target_schema_name", "")
+    target_table = params.get("target_table_name", "")
+
+    source_catalog = params.get("source_catalog_name", "")
+    source_schema = params.get("source_schema_name", "")
+    source_table = params.get("source_table_name", "")
+
+    qualified_target_table = build_qualified(target_catalog, target_schema, target_table)
+    qualified_source_schema = build_qualified(source_catalog, source_schema, "")[:-2]  # remove trailing .`
+
+    load_type = params.get("load_type", "FULL").upper()
+
+    logger.info(f"Starting transformation job for {qualified_target_table}")
+    logger.info(f"Source schema: {qualified_source_schema}")
+    logger.info(f"Load type: {load_type}")
+
+    # -------------------------------------------------------------------
+    #  Create stage data frame
+    # -------------------------------------------------------------------
+    stage_df = create_stage_df(spark, qualified_source_schema)
+
+    # -------------------------------------------------------------------
+    #  Union with stage queue filter table
+    # -------------------------------------------------------------------
+    try:
+        filter_table = build_qualified(source_catalog, source_schema, "wfm_queue_filters")
+        logger.info(f"Reading {filter_table} for union")
+        stage_queue_df = spark.table(filter_table)
+        final_df = stage_df.unionByName(stage_queue_df, allowMissingColumns=True)
+    except Exception as e:
+        logger.warning(f"Could not read filters table ({e}), using stage_df only.")
+        final_df = stage_df
+
+    # Add metadata column
+    final_df = final_df.withColumn("ingested_at", F.current_timestamp())
+
+    # -------------------------------------------------------------------
+    #  Write to target table
+    # -------------------------------------------------------------------
+    logger.info(f"Writing to target table {qualified_target_table}")
+    if load_type == "FULL":
+        final_df.write.mode("overwrite").saveAsTable(qualified_target_table)
+    else:
+        final_df.write.mode("append").saveAsTable(qualified_target_table)
+
+    logger.info("Transformation complete.")
+    spark.stop()
+
+
+# -------------------------------------------------------------------
+#  Entry point
+# -------------------------------------------------------------------
+if _name_ == "_main_":
+    main()
