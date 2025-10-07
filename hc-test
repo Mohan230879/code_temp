@@ -1,0 +1,29 @@
+from pyspark.sql.functions import col, coalesce, lit
+from delta.tables import DeltaTable
+
+# Read the source temp table
+source_df = spark.table("dbo.t_verintwfm_queue_filters")
+
+# Get Delta table reference
+target_table = DeltaTable.forName(spark, "dbo.verintwfm_queue_filters_history")
+
+# Perform the merge (UPDATE)
+target_table.alias("f").merge(
+    source_df.alias("s"),
+    """
+    f.FilterID = s.FilterID 
+    AND f.ViewID = s.ViewID 
+    AND f.QueueID = s.QueueID
+    AND (
+        f.FilterName != s.FilterName
+        OR f.ViewName != s.ViewName
+        OR COALESCE(f.QueueName, '') != COALESCE(s.QueueName, '')
+    )
+    """
+).whenMatchedUpdate(
+    set={
+        "FilterName": "s.FilterName",
+        "ViewName": "s.ViewName",
+        "QueueName": "s.QueueName"
+    }
+).execute()
