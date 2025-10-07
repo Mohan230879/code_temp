@@ -1,0 +1,133 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit, when, current_timestamp, to_date
+from datetime import datetime
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("VerintVFM_Queue_Filters_Migration") \
+    .getOrCreate()
+
+# Set current datetime
+now = datetime.now()
+
+# Step 1: Create staging table structure
+staging_columns = [
+    "Filters", "Filtername", "ViewID", "Viewname", 
+    "QueueID", "Queuename"
+]
+
+# Step 2: Insert data into staging table from source
+staging_df = spark.table("dbo.VerintVFM_queue_filters").select(
+    col("Filters"),
+    col("Filtername"),
+    col("ViewID"),
+    col("Viewname"),
+    col("QueueID"),
+    col("Queuename")
+)
+
+# Create temporary view for staging
+staging_df.createOrReplaceTempView("et_VerintVFM_queue_filters")
+
+# Step 3: Merge logic - Insert rows with no current alignment
+# First, get existing data
+existing_df = spark.table("dbo.VerintVFM_queue_filters")
+
+# Left outer join to find rows that don't exist in target
+rows_to_insert = staging_df.alias("qf").join(
+    existing_df.alias("e"),
+    (col("qf.Filters") == col("e.Filters")) & 
+    (col("qf.QueueID") == col("e.QueueID")),
+    "left"
+).where(col("e.QueueID").isNull()).select(
+    col("qf.Filters"),
+    col("qf.Filtername"),
+    col("qf.ViewID"),
+    col("qf.Viewname"),
+    col("qf.QueueID"),
+    col("qf.Queuename")
+)
+
+# Add metadata columns for insert
+rows_to_insert_with_meta = rows_to_insert.withColumn(
+    "RecordStartDateTime", lit(now)
+).withColumn(
+    "RecordEndDateTime", lit(None).cast("timestamp")
+).withColumn(
+    "RecordStartDateTimeInclusive", lit(now)
+).withColumn(
+    "RecordEndDateTimeExclusive", lit(None).cast("timestamp")
+).withColumn(
+    "RecordStartDateInclusiveAlternate", lit('1935-12-31')
+).withColumn(
+    "RecordStartDateInclusiveFlag", 
+    when(col("QueueID").isNotNull(), lit('Does not exist in the staging set.'))
+    .otherwise(lit(''))
+)
+
+# Step 4: Update non-temporal attributes for existing rows
+update_df = existing_df.alias("t").join(
+    staging_df.alias("qf"),
+    (col("t.Filters") == col("qf.Filters")) & 
+    (col("t.QueueID") == col("qf.QueueID")),
+    "inner"
+).select(
+    col("qf.Filtername").alias("new_Filtername"),
+    col("qf.Viewname").alias("new_Viewname"),
+    col("qf.QueueID").alias("new_QueueID"),
+    col("qf.Queuename").alias("new_Queuename"),
+    col("t.Filters"),
+    col("t.ViewID"),
+    col("t.QueueID")
+).where(
+    (col("t.Filtername") != col("qf.Filtername")) |
+    (col("t.Viewname") != col("qf.Viewname")) |
+    (col("t.QueueID") != col("qf.QueueID")) |
+    (col("t.Queuename") != col("qf.Queuename"))
+)
+
+# Apply updates (in production, you'd use Delta Lake MERGE or overwrite logic)
+# For now, showing the transformation logic
+
+# Step 5: Handle temporal updates (SLOWLY CHANGING DIMENSION Type 2)
+# Update RecordEndDateTime for records that changed
+expired_records = existing_df.alias("t").join(
+    staging_df.alias("s"),
+    (col("t.Filters") == col("s.Filters")) & 
+    (col("t.QueueID") == col("s.QueueID")),
+    "left"
+).where(
+    col("s.QueueID").isNull()
+).withColumn("RecordEndDateTime", lit(now)) \
+ .withColumn("RecordEndDateTimeExclusive", lit(now))
+
+# Step 6: Insert new rows with alignment
+new_aligned_rows = staging_df.alias("s").join(
+    existing_df.alias("t"),
+    col("s.Filters") == col("t.Filters"),
+    "left"
+).where(col("t.Filters").isNull()).select(
+    col("s.Filters"),
+    col("s.Filtername"),
+    col("s.ViewID"),
+    col("s.Viewname"),
+    col("s.QueueID"),
+    col("s.Queuename"),
+    lit(now).alias("RecordStartDateTime"),
+    lit(None).cast("timestamp").alias("RecordEndDateTime"),
+    lit(now).alias("RecordStartDateTimeInclusive"),
+    lit(None).cast("timestamp").alias("RecordEndDateTimeExclusive"),
+    lit('1935-12-31').alias("RecordStartDateInclusiveAlternate")
+)
+
+# Final result - combine all operations
+# In practice with Delta Lake, you'd use MERGE statement
+final_df = existing_df.unionByName(rows_to_insert_with_meta, allowMissingColumns=True)
+
+# Write back to table (overwrite or use Delta Lake MERGE)
+final_df.write.mode("overwrite").saveAsTable("dbo.VerintVFM_queue_filters")
+
+# Or create as a view
+final_df.createOrReplaceTempView("VerintVFM_queue_filters_history")
+
+print("Migration completed successfully"
