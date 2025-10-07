@@ -27,3 +27,45 @@ target_table.alias("f").merge(
         "QueueName": "s.QueueName"
     }
 ).execute()
+
+
+------------------------------------------------------------------------------
+
+from pyspark.sql.functions import col, current_date, current_timestamp, lit
+from datetime import datetime
+
+# Define variables (equivalent to @today and @now)
+today = current_date()
+now = current_timestamp()
+
+# Read the source temp table
+source_df = spark.table("dbo.t_verintwfm_queue_filters").alias("s")
+
+# Read the target table
+target_df = spark.table("dbo.verintwfm_queue_filters_history").alias("f")
+
+# Filter target for active records only (RecordEndDateNonInclusive = '9999-12-31')
+active_target_df = target_df.filter(col("f.RecordEndDateNonInclusive") == lit("9999-12-31"))
+
+# Find rows that don't exist in target (NOT EXISTS equivalent)
+new_rows = source_df.join(
+    active_target_df,
+    (col("s.FilterID") == col("f.FilterID")) &
+    (col("s.ViewID") == col("f.ViewID")) &
+    (col("s.QueueID") == col("f.QueueID")),
+    "left_anti"  # LEFT ANTI JOIN = NOT EXISTS
+).select(
+    col("s.FilterID").alias("FilterID"),
+    col("s.FilterName").alias("FilterName"),
+    col("s.ViewID").alias("ViewID"),
+    col("s.ViewName").alias("ViewName"),
+    col("s.QueueID").alias("QueueID"),
+    col("s.QueueName").alias("QueueName"),
+    today.alias("RecordStartDateInclusive"),
+    lit("9999-12-31").alias("RecordEndDateTimeInclusive"),
+    now.alias("RecordCreatedDateTime"),
+    now.alias("RecordLastModifiedDateTime")
+)
+
+# Insert new rows
+new_rows.write.mode("append").saveAsTable("dbo.verintwfm_queue_filters_history")
