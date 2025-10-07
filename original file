@@ -1,0 +1,109 @@
+DECLARE @now [datetime];
+DECLARE @today [date];
+SET @now = GETDATE();
+SET @today = GETDATE();
+
+CREATE TABLE [#t_verintwfm_queue_filters]
+(
+    [FilterID] [int] NOT NULL,
+    [FilterName] [varchar](255) NOT NULL,
+    [ViewID] [int] NOT NULL,
+    [ViewName] [varchar](255) NOT NULL,
+    [QueueID] [varchar](25) NOT NULL,
+    [QueueName] [varchar](255) NULL
+);
+
+INSERT INTO [#t_verintwfm_queue_filters]
+(
+    [FilterID],
+    [FilterName],
+    [ViewID],
+    [ViewName],
+    [QueueID],
+    [QueueName]
+)
+SELECT
+    [qf].[FilterID],
+    [qf].[FilterName],
+    [qf].[ViewID],
+    [qf].[ViewName],
+    [qf].[QueueID],
+    [q].[QueueName]
+FROM [dbo].[verintwfm_queue_filters] [qf] WITH (NoLock)
+LEFT OUTER JOIN [dbo].[verintwfm_queue] [q] WITH (NoLock)
+    ON [qf].[QueueID] = [q].[QueueID]
+;
+
+-- Term existing rows with no current alignment...
+UPDATE [f]
+SET [RecordEndDateTimeInclusive] = @today,
+    [RecordLastModifiedDateTime] = @now
+FROM [dbo].[verintwfm_queue_filters_history] [f]
+LEFT OUTER JOIN [#t_verintwfm_queue_filters] [s]
+    ON [f].[FilterID] = [s].[FilterID]
+    AND [f].[ViewID] = [s].[ViewID]
+    AND [f].[QueueID] = [s].[QueueID]
+WHERE [f].[RecordEndDateNonInclusive] = '9999-12-31'
+    -- Alignment is not already termed...
+    AND [s].[QueueID] IS NULL
+    -- Does not exist in the staging set.
+;
+
+-- Update non-temporal attributes...
+UPDATE [f]
+SET [f].[FilterName] = [s].[FilterName],
+    [f].[ViewName] = [s].[ViewName],
+    [f].[QueueName] = [s].[QueueName]
+FROM [dbo].[verintwfm_queue_filters_history] [f]
+INNER JOIN [#t_verintwfm_queue_filters] [s]
+    ON [f].[FilterID] = [s].[FilterID]
+    AND [f].[ViewID] = [s].[ViewID]
+    AND [f].[QueueID] = [s].[QueueID]
+AND
+(
+    [f].[FilterName] != [s].[FilterName]
+    OR [f].[ViewName] != [s].[ViewName]
+    OR ISNULL([f].[QueueName], '') != ISNULL([s].[QueueName], '')
+)
+;
+
+-- Insert new rows with an alignment...
+INSERT INTO [dbo].[verintwfm_queue_filters_history]
+(
+    [FilterID],
+    [FilterName],
+    [ViewID],
+    [ViewName],
+    [QueueID],
+    [QueueName],
+    [RecordStartDateInclusive],
+    [RecordEndDateTimeInclusive],
+    [RecordCreatedDateTime],
+    [RecordLastModifiedDateTime]
+)
+SELECT
+    [s].[FilterID],
+    [s].[FilterName],
+    [s].[ViewID],
+    [s].[ViewName],
+    [s].[QueueID],
+    [s].[QueueName],
+    @today as [RecordStartDateInclusive],
+    '9999-12-31' as [RecordEndDateTimeInclusive],
+    @now as [RecordCreatedDateTime],
+    @now as [RecordLastModifiedDateTime]
+FROM [#t_verintwfm_queue_filters] [s]
+WHERE NOT EXISTS
+(
+    SELECT
+        [f].[RecordID]
+    FROM [dbo].[verintwfm_queue_filters_history] [f]
+    WHERE [s].[FilterID] = [f].[FilterID]
+    AND [s].[ViewID] = [f].[ViewID]
+    AND [s].[QueueID] = [f].[QueueID]
+    AND [f].[RecordEndDateNonInclusive] = '9999-12-31'
+)
+;
+
+-- Cleanup...
+DROP TABLE [#t_verintwfm_queue_filters];
