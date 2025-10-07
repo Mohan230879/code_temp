@@ -1,0 +1,37 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, date_format
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("WFM_Staffing_Report") \
+    .getOrCreate()
+
+# Read the source table
+df = spark.table("dbo.wfm_staffing_report_iso_outlook")
+
+# Create the view with transformations
+wfm_staffing_report_iso_outlook_vw = df.select(
+    col("DateTime"),
+    date_format(col("DateTime"), "d").alias("Date"),
+    date_format(col("DateTime"), "t").alias("Interval"),
+    col("VerintQueueFilterViewName").alias("ViewName"),
+    col("Partner"),
+    col("Site"),
+    col("LineOfBusiness"),
+    col("ServiceModel"),
+    col("ForecastRequired").alias("ForecastReq"),
+    col("ForecastFTE"),
+    col("ForecastAHT"),
+    col("ForecastVolume"),
+    col("ContractualRequired").alias("OfficialRequired"),
+    col("ErlangRequired").alias("ErlangRequired")
+)
+
+# Create or replace temporary view
+wfm_staffing_report_iso_outlook_vw.createOrReplaceTempView("wfm_staffing_report_iso_outlook_vw")
+
+# Optionally, you can also save it as a permanent table
+# wfm_staffing_report_iso_outlook_vw.write.mode("overwrite").saveAsTable("dbo.wfm_staffing_report_iso_outlook_vw")
+
+# Display the result (optional)
+wfm_staffing_report_iso_outlook_vw.show()
