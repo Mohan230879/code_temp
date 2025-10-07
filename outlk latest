@@ -1,0 +1,165 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, lit, when, current_timestamp, current_date, 
+    coalesce, isnull, trim
+)
+from pyspark.sql.types import (
+    StructType, StructField, IntegerType, 
+    StringType, TimestampType, DateType
+)
+from datetime import datetime, date
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("VerintVFM_Queue_Filters") \
+    .getOrCreate()
+
+# Declare date variables
+now = current_timestamp()
+today = current_date()
+
+# Step 1: Create table #t_verintvfm_queue_filters
+schema = StructType([
+    StructField("FilterID", IntegerType(), nullable=False),
+    StructField("FilterName", StringType(), nullable=False),
+    StructField("ViewID", IntegerType(), nullable=False),
+    StructField("ViewName", StringType(), nullable=False),
+    StructField("QueueID", StringType(), nullable=False),
+    StructField("QueueName", StringType(), nullable=True)
+])
+
+# Step 2: Insert data from source into temp table
+temp_df = spark.table("dbo.verintvfm_queue_filters").select(
+    col("FilterID"),
+    col("FilterName"),
+    col("ViewID"),
+    col("ViewName"),
+    col("QueueID"),
+    col("QueueName")
+).join(
+    spark.table("dbo.verintvfm_queue").alias("q"),
+    col("QueueID") == col("q.QueueID"),
+    "left"
+)
+
+# Create temp view
+temp_df.createOrReplaceTempView("t_verintvfm_queue_filters")
+
+# Step 3: Term existing rows with no current alignment (UPDATE)
+# Read the history table
+history_df = spark.table("dbo.verintvfm_queue_filters_history")
+
+# Identify rows to update
+rows_to_update = history_df.alias("f").join(
+    temp_df.alias("s"),
+    (col("f.FilterID") == col("s.FilterID")) &
+    (col("f.ViewID") == col("s.ViewID")) &
+    (col("f.QueueID") == col("s.QueueID")),
+    "left"
+).where(
+    (col("f.RecordEndDateNonInclusive") == lit('9999-12-31')) &
+    col("s.QueueID").isNull()
+)
+
+# Apply updates
+updated_history_df = history_df.alias("f").join(
+    rows_to_update.select("FilterID", "ViewID", "QueueID").alias("upd"),
+    (col("f.FilterID") == col("upd.FilterID")) &
+    (col("f.ViewID") == col("upd.ViewID")) &
+    (col("f.QueueID") == col("upd.QueueID")),
+    "left"
+).withColumn(
+    "RecordEndDateNonInclusive",
+    when(col("upd.FilterID").isNotNull(), today)
+    .otherwise(col("f.RecordEndDateNonInclusive"))
+).withColumn(
+    "RecordLastModifiedDateTime",
+    when(col("upd.FilterID").isNotNull(), now)
+    .otherwise(col("f.RecordLastModifiedDateTime"))
+).select("f.*")
+
+# Step 4: Update non-temporal attributes (UPDATE)
+non_temporal_updates = history_df.alias("f").join(
+    temp_df.alias("s"),
+    col("f.FilterID") == col("s.FilterID"),
+    "inner"
+).where(
+    (col("f.ViewID") == col("s.ViewID")) &
+    (col("f.QueueID") == col("s.QueueID")) &
+    (
+        (col("f.FilterName") != col("s.FilterName")) |
+        (col("f.ViewName") != col("s.ViewName")) |
+        (coalesce(col("f.QueueName"), lit('')) != coalesce(col("s.QueueName"), lit('')))
+    )
+)
+
+# Apply non-temporal updates
+updated_history_df = updated_history_df.alias("f").join(
+    non_temporal_updates.select(
+        col("s.FilterID"),
+        col("s.FilterName").alias("new_FilterName"),
+        col("s.ViewName").alias("new_ViewName"),
+        col("s.QueueName").alias("new_QueueName")
+    ).alias("upd"),
+    col("f.FilterID") == col("upd.FilterID"),
+    "left"
+).select(
+    col("f.FilterID"),
+    when(col("upd.FilterID").isNotNull(), col("upd.new_FilterName"))
+        .otherwise(col("f.FilterName")).alias("FilterName"),
+    col("f.ViewID"),
+    when(col("upd.FilterID").isNotNull(), col("upd.new_ViewName"))
+        .otherwise(col("f.ViewName")).alias("ViewName"),
+    col("f.QueueID"),
+    when(col("upd.FilterID").isNotNull(), col("upd.new_QueueName"))
+        .otherwise(col("f.QueueName")).alias("QueueName"),
+    col("f.RecordStartDateInclusive"),
+    col("f.RecordEndDateNonInclusive"),
+    col("f.RecordCreatedDateTime"),
+    col("f.RecordLastModifiedDateTime")
+)
+
+# Step 5: Insert new rows with alignment
+# Find rows that don't exist in history
+new_rows = temp_df.alias("s").join(
+    history_df.alias("f"),
+    (col("s.FilterID") == col("f.FilterID")) &
+    (col("s.ViewID") == col("f.ViewID")) &
+    (col("s.QueueID") == col("f.QueueID")) &
+    (col("f.RecordEndDateNonInclusive") == lit('9999-12-31')),
+    "left_anti"
+)
+
+# Add metadata columns for new rows
+new_rows_with_meta = new_rows.select(
+    col("FilterID"),
+    col("FilterName"),
+    col("ViewID"),
+    col("ViewName"),
+    col("QueueID"),
+    col("QueueName"),
+    today.alias("RecordStartDateInclusive"),
+    lit('9999-12-31').cast(DateType()).alias("RecordEndDateNonInclusive"),
+    now.alias("RecordCreatedDateTime"),
+    now.alias("RecordLastModifiedDateTime")
+)
+
+# Step 6: Combine all data
+final_df = updated_history_df.unionByName(new_rows_with_meta, allowMissingColumns=True)
+
+# Write back to history table
+final_df.write \
+    .mode("overwrite") \
+    .option("mergeSchema", "true") \
+    .saveAsTable("dbo.verintvfm_queue_filters_history")
+
+# Step 7: Clean up - Drop temporary table (not needed in Spark, just unpersist if cached)
+spark.catalog.dropTempView("t_verintvfm_queue_filters")
+
+print("Queue filters migration completed successfully")
+print(f"Total records: {final_df.count()}")
+
+# Optional: Show sample of results
+print("\nSample of final data:")
+final_df.show(10, truncate=False)
+
