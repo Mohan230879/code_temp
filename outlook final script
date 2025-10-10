@@ -1,0 +1,406 @@
+Content is user-generated and unverified.
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, when, length, coalesce, lit, cast, trim, upper,
+    current_date, date_add, date_format, datepart, sum as _sum,
+    avg, count, isnan, isnull, concat, substring, expr,
+    minute, datediff, to_date, floor, regexp_replace
+)
+from pyspark.sql.types import StringType, IntegerType, FloatType, DateType
+from pyspark.sql.window import Window
+
+# Initialize Spark Session
+spark = SparkSession.builder.appName("SQLToPySpark").getOrCreate()
+
+# ==================== Variable Declaration ====================
+from datetime import datetime
+now = datetime.now()
+
+# ==================== Queue Filter References ====================
+
+# Create temp table: ft_queue_filters
+df_queue_filters = spark.createDataFrame([
+    # Add your data here as list of tuples or load from source
+], schema="""
+    ViewName string,
+    QueueID string,
+    Partner string,
+    Site string,
+    LineOfBusiness string,
+    ServiceModel string,
+    RecordStartDateInclusive timestamp,
+    RecordEndDateNonInclusive timestamp
+""")
+
+# Create clustered index (PySpark doesn't have indexes, but we can cache and partition)
+df_queue_filters = df_queue_filters.repartition("ViewName", "QueueID", "RecordStartDateInclusive")
+df_queue_filters.cache()
+
+# Create unique index
+# Note: Spark doesn't enforce uniqueness, but we can check for duplicates
+# df_queue_filters.groupBy("QueueID", "RecordStartDateInclusive", "RecordEndDateNonInclusive", "ViewName").count().filter(col("count") > 1).show()
+
+# Insert data from CROSS APPLY
+df_wfm_staffing = spark.table("dbo.tvf_split_wfm_staffing_map_viewname")
+
+df_queue_filters_insert = df_wfm_staffing.filter(
+    (col("FilterName").isin("Staffing Outlook", "EHS Staffing Outlook", "ESS Staffing Outlook"))
+).crossJoin(
+    spark.table("dbo.verintwfm_queue_filters_history").alias("qf")
+).select(
+    col("qf.ViewName"),
+    col("qf.QueueID"),
+    col("qf.Partner"),
+    col("qf.Site"),
+    col("qf.LineOfBusiness"),
+    col("qf.ServiceModel"),
+    col("qf.RecordStartDateInclusive"),
+    col("qf.RecordEndDateNonInclusive")
+)
+
+# Union with existing data
+df_queue_filters = df_queue_filters.union(df_queue_filters_insert)
+
+# ==================== Forecast Requirements ====================
+
+# Create temp table: ft_forecast_requirement
+df_forecast_requirement = spark.createDataFrame([], schema="""
+    DateTime timestamp,
+    ViewName string,
+    Partner string,
+    Site string,
+    LineOfBusiness string,
+    ServiceModel string,
+    ForecastRequirement float
+""")
+
+# Insert with DATEADD logic
+df_forecast_req_source = spark.table("dbo.verintwfm_forecast_fte").alias("r")
+
+df_forecast_requirement = df_forecast_req_source.select(
+    when(
+        (minute(col("r.DateTime")) % 15).isin([15, 45]),
+        expr("date_add(DateTime, interval -15 minute)")
+    ).otherwise(col("r.DateTime")).alias("DateTime"),
+    col("r.ViewName"),
+    col("r.Partner"),
+    col("r.Site"),
+    col("r.LineOfBusiness"),
+    col("r.ServiceModel"),
+    (_sum(col("r.ForecastReq")) / 2.0).alias("ForecastReq")
+).groupBy(
+    when(
+        (minute(col("r.DateTime")) % 15).isin([15, 45]),
+        expr("date_add(DateTime, interval -15 minute)")
+    ).otherwise(col("r.DateTime")),
+    col("m.ViewName"),
+    col("m.Partner"),
+    col("m.Site"),
+    col("m.LineOfBusiness"),
+    col("m.ServiceModel")
+).agg(
+    _sum(col("ForecastReq")).alias("ForecastReq")
+)
+
+# Add nested SELECT with queue filters join
+df_inner = spark.table("dbo.verintwfm_forecast_fte").alias("r").join(
+    df_queue_filters.alias("m"),
+    (col("r.QueueID") == col("m.QueueID")) &
+    (col("r.DateTime") >= col("m.RecordStartDateInclusive")) &
+    (col("r.DateTime") < col("m.RecordEndDateNonInclusive")),
+    "inner"
+).filter(
+    (col("r.DateTime") >= "7/13/2025") &
+    (col("r.DateTime") < "8/31/2025") &
+    (col("r.FTE") > 0) &
+    (col("r.FTE").isNotNull())
+).groupBy(
+    col("r.DateTime"),
+    col("m.ViewName"),
+    col("m.Partner"),
+    col("m.Site"),
+    col("m.LineOfBusiness"),
+    col("m.ServiceModel")
+).agg(
+    _sum(col("r.ForecastReq")).alias("ForecastReq")
+)
+
+# Apply final CASE WHEN DATEPART transformation
+df_forecast_requirement = df_inner.select(
+    when(
+        (expr("minute(DateTime) % 15").isin([15, 45])),
+        expr("date_add(DateTime, interval -15 minute)")
+    ).otherwise(col("DateTime")).alias("DateTime"),
+    col("ViewName"),
+    col("Partner"),
+    col("Site"),
+    col("LineOfBusiness"),
+    col("ServiceModel")
+)
+
+# ==================== Forecast Queue ====================
+
+df_forecast_queue = spark.createDataFrame([], schema="""
+    DateTime timestamp,
+    ViewName string,
+    Partner string,
+    Site string,
+    LineOfBusiness string,
+    ServiceModel string,
+    ForecastFTE float
+""")
+
+# Insert logic similar to above with queue joins
+df_fq_source = spark.table("dbo.verintwfm_forecast_fte").alias("q")
+
+df_forecast_queue = df_fq_source.join(
+    df_queue_filters.alias("m"),
+    (col("q.QueueID") == col("m.QueueID")) &
+    (col("q.DateTime") >= col("m.RecordStartDateInclusive")) &
+    (col("q.DateTime") < col("m.RecordEndDateNonInclusive")),
+    "inner"
+).filter(
+    (col("q.DateTime") >= "7/13/2025") &
+    (col("q.DateTime") < "8/31/2025") &
+    (col("q.FTE") > 0) &
+    (col("q.FTE").isNotNull())
+).select(
+    col("q.DateTime"),
+    col("m.ViewName"),
+    col("m.Partner"),
+    col("m.Site"),
+    col("m.LineOfBusiness"),
+    col("m.ServiceModel"),
+    col("q.ForecastFTE")
+)
+
+# ==================== Forecast Volume ====================
+
+df_forecast_volume = spark.createDataFrame([], schema="""
+    DateTime timestamp,
+    ViewName string,
+    Partner string,
+    Site string,
+    LineOfBusiness string,
+    ServiceModel string,
+    ForecastVolume float,
+    ForecastAHT float
+""")
+
+# Complex CASE WHEN with DATEADD and DATEPART
+df_fv_source = spark.table("dbo.verintwfm_forecast_queue").alias("q")
+
+df_forecast_volume = df_fv_source.select(
+    when(
+        (expr("minute(DateTime) % 15").isin([15, 45])),
+        expr("date_add(DateTime, interval -15 minute)")
+    ).otherwise(col("DateTime")).alias("DateTime"),
+    col("q.ViewName"),
+    col("q.Partner"),
+    col("q.Site"),
+    col("q.LineOfBusiness"),
+    col("q.ServiceModel"),
+    (_sum(col("q.ForecastVolume"))).alias("ForecastVolume"),
+    (
+        _sum(col("q.ForecastHandleTime")) / 
+        when(
+            isnull(_sum(col("q.CALLVOLUME"))), lit(0)
+        ).otherwise(_sum(col("q.CALLVOLUME")))
+    ).alias("ForecastAHT")
+).groupBy(
+    when(
+        (expr("minute(DateTime) % 15").isin([15, 45])),
+        expr("date_add(DateTime, interval -15 minute)")
+    ).otherwise(col("DateTime")),
+    col("m.ViewName"),
+    col("m.Partner"),
+    col("m.Site"),
+    col("m.LineOfBusiness"),
+    col("m.ServiceModel")
+)
+
+# Inner SELECT with joins
+df_fv_inner = spark.table("dbo.verintwfm_forecast_queue").alias("q").join(
+    df_queue_filters.alias("m"),
+    (col("q.QueueID") == col("m.QueueID")) &
+    (col("q.DateTime") >= col("m.RecordStartDateInclusive")) &
+    (col("q.DateTime") < col("m.RecordEndDateNonInclusive")),
+    "inner"
+).filter(
+    (col("q.DateTime") >= "7/13/2025") &
+    (col("q.DateTime") < "8/31/2025") &
+    (col("q.CALLVOLUME") > 0) &
+    (col("q.CALLVOLUME").isNotNull())
+).groupBy(
+    col("q.DateTime"),
+    col("m.ViewName"),
+    col("m.Partner"),
+    col("m.Site"),
+    col("m.LineOfBusiness"),
+    col("m.ServiceModel")
+)
+
+# ==================== Contract Required ====================
+
+df_required = spark.createDataFrame([], schema="""
+    DateTime timestamp,
+    ViewName string,
+    Partner string,
+    Site string,
+    LineOfBusiness string,
+    ServiceModel string,
+    ContractRequired float
+""")
+
+# Insert with complex joins
+df_req_source = spark.table("dbo.wfm_staffing_requirement").alias("r")
+
+df_required = df_req_source.join(
+    df_wfm_staffing.alias("tvf"),
+    (col("tvf.ViewName").contains(col("r.ViewName"), lit(":")))
+).crossJoin(
+    spark.table("dbo.verintwfm_queue_filters_history").alias("qf")
+).filter(
+    (col("r.DateTime") >= "8/31/2025") &
+    (col("r.DateTime") < "2025-01-12") &
+    (col("r.Required") > 0) &
+    (col("r.Required").isNotNull())
+).select(
+    col("r.DateTime"),
+    col("r.ViewName"),
+    col("r.Partner"),
+    col("r.Site"),
+    col("r.LineOfBusiness"),
+    col("r.ServiceModel"),
+    col("r.Required").alias("ContractRequired")
+)
+
+# ==================== Erlang Forecast Required ====================
+
+df_erlang_required = spark.createDataFrame([], schema="""
+    DateTime timestamp,
+    ViewName string,
+    Partner string,
+    Site string,
+    LineOfBusiness string,
+    ServiceModel string,
+    ErlangRequired float
+""")
+
+# Insert with SUM aggregation
+df_er_source = spark.table("dbo.wfm_erlang_forecast_required_fte").alias("r")
+
+df_erlang_required = df_er_source.join(
+    df_queue_filters.alias("f"),
+    (col("r.QueueID") == col("f.QueueID")) &
+    (col("r.DateTime") >= col("f.RecordStartDateInclusive")) &
+    (col("r.DateTime") < col("f.RecordEndDateNonInclusive")),
+    "inner"
+).filter(
+    (col("r.DateTime") >= "7/13/2025") &
+    (col("r.DateTime") < "8/31/2025")
+).groupBy(
+    col("r.DateTime"),
+    col("f.ViewName"),
+    col("f.Partner"),
+    col("f.Site"),
+    col("f.LineOfBusiness"),
+    col("f.ServiceModel")
+).agg(
+    _sum(col("r.RequiredFTE")).alias("ErlangRequired")
+)
+
+# ==================== Blend Data ====================
+
+# TRUNCATE TABLE equivalent
+spark.sql("TRUNCATE TABLE dbo.wfm_staffing_report_iso_outlook")
+
+# INSERT INTO with complex nested SELECTs and ISNULLs
+df_staffing_report = spark.createDataFrame([], schema="""
+    DateTime timestamp,
+    VerintQueueFilterViewName string,
+    Partner string,
+    Site string,
+    LineOfBusiness string,
+    ServiceModel string,
+    ForecastRequired float,
+    ForecastFTE float,
+    ForecastAHT float,
+    ForecastVolume float,
+    ContractualRequired float,
+    ErlangRequired float,
+    RecordCreatedDateTime timestamp
+""")
+
+# Create base SELECT with ISNULLs
+df_base = spark.table("frfqfvcr").select(
+    when(col("frfqfvcr.DateTime").isNull(), col("ee.DateTime")).otherwise(col("frfqfvcr.DateTime")).alias("DateTime"),
+    when(col("frfqfvcr.ViewName").isNull(), col("ee.ViewName")).otherwise(col("frfqfvcr.ViewName")).alias("ViewName"),
+    when(col("frfqfvcr.Partner").isNull(), col("ee.Partner")).otherwise(col("frfqfvcr.Partner")).alias("Partner"),
+    when(col("frfqfvcr.Site").isNull(), col("ee.Site")).otherwise(col("frfqfvcr.Site")).alias("Site"),
+    when(col("frfqfvcr.LineOfBusiness").isNull(), col("ee.LineOfBusiness")).otherwise(col("frfqfvcr.LineOfBusiness")).alias("LineOfBusiness"),
+    when(col("frfqfvcr.ServiceModel").isNull(), col("ee.ServiceModel")).otherwise(col("frfqfvcr.ServiceModel")).alias("ServiceModel"),
+    when(col("frfqfvcr.ForecastRequired").isNull(), lit(0)).otherwise(col("frfqfvcr.ForecastRequired")).alias("ForecastRequired"),
+    when(col("frfqfvcr.ForecastFTE").isNull(), lit(0)).otherwise(col("frfqfvcr.ForecastFTE")).alias("ForecastFTE"),
+    when(col("fv.ForecastAHT").isNull(), lit(0)).otherwise(col("fv.ForecastAHT")).alias("ForecastAHT"),
+    when(col("fv.ForecastVolume").isNull(), lit(0)).otherwise(col("fv.ForecastVolume")).alias("ForecastVolume"),
+    when(col("cr.ContractRequired").isNull(), lit(0)).otherwise(col("cr.ContractRequired")).alias("ContractualRequired"),
+    when(col("er.ErlangRequired").isNull(), lit(0)).otherwise(col("er.ErlangRequired")).alias("ErlangRequired"),
+    expr("now()").alias("RecordCreatedDateTime")
+)
+
+# Nested FROM with multiple FULL OUTER JOINs
+# frfqfvcr subquery
+df_frfqfvcr = df_forecast_requirement.alias("fr").join(
+    df_forecast_queue.alias("fq"),
+    (col("fr.DateTime") == col("fq.DateTime")) &
+    (col("fr.ViewName") == col("fq.ViewName")),
+    "full_outer"
+).join(
+    df_forecast_volume.alias("fv"),
+    (when(col("frfq.DateTime").isNull(), col("fv.DateTime")).otherwise(col("frfq.DateTime")) == col("fv.DateTime")) &
+    (when(col("frfq.ViewName").isNull(), col("fv.ViewName")).otherwise(col("frfq.ViewName")) == col("fv.ViewName")),
+    "full_outer"
+).join(
+    df_required.alias("cr"),
+    (when(col("frfqfv.DateTime").isNull(), col("cr.DateTime")).otherwise(col("frfqfv.DateTime")) == col("cr.DateTime")) &
+    (when(col("frfqfv.VerintQueueFilterViewName").isNull(), col("cr.ViewName")).otherwise(col("frfqfv.VerintQueueFilterViewName")) == col("cr.ViewName")),
+    "full_outer"
+).join(
+    df_erlang_required.alias("er"),
+    (col("frfqfvcr.DateTime") == col("er.DateTime")) &
+    (col("frfqfvcr.ViewName") == col("er.ViewName")),
+    "full_outer"
+)
+
+# Final SELECT with all ISNULLs applied
+df_final = df_frfqfvcr.select(
+    when(col("frfqfvcr.DateTime").isNull(), col("ee.DateTime")).otherwise(col("frfqfvcr.DateTime")).alias("DateTime"),
+    when(col("frfqfvcr.ViewName").isNull(), col("ee.ViewName")).otherwise(col("frfqfvcr.ViewName")).alias("VerintQueueFilterViewName"),
+    when(col("frfqfvcr.Partner").isNull(), col("ee.Partner")).otherwise(col("frfqfvcr.Partner")).alias("Partner"),
+    when(col("frfqfvcr.Site").isNull(), col("ee.Site")).otherwise(col("frfqfvcr.Site")).alias("Site"),
+    when(col("frfqfvcr.LineOfBusiness").isNull(), col("ee.LineOfBusiness")).otherwise(col("frfqfvcr.LineOfBusiness")).alias("LineOfBusiness"),
+    when(col("frfqfvcr.ServiceModel").isNull(), col("ee.ServiceModel")).otherwise(col("frfqfvcr.ServiceModel")).alias("ServiceModel"),
+    when(col("fr.ForecastRequired").isNull(), lit(0)).otherwise(col("fr.ForecastRequired")).cast(FloatType()).alias("ForecastRequired"),
+    when(col("fq.ForecastFTE").isNull(), lit(0)).otherwise(col("fq.ForecastFTE")).cast(FloatType()).alias("ForecastFTE"),
+    when(col("fv.ForecastAHT").isNull(), lit(0)).otherwise(col("fv.ForecastAHT")).cast(FloatType()).alias("ForecastAHT"),
+    when(col("fv.ForecastVolume").isNull(), lit(0)).otherwise(col("fv.ForecastVolume")).cast(FloatType()).alias("ForecastVolume"),
+    when(col("cr.ContractRequired").isNull(), lit(0)).otherwise(col("cr.ContractRequired")).cast(FloatType()).alias("ContractualRequired"),
+    when(col("er.ErlangRequired").isNull(), lit(0)).otherwise(col("er.ErlangRequired")).cast(FloatType()).alias("ErlangRequired"),
+    expr("current_timestamp()").alias("RecordCreatedDateTime")
+)
+
+# Write to target table
+df_final.write.mode("append").saveAsTable("dbo.wfm_staffing_report_iso_outlook")
+
+# ==================== Temp Object Cleanup ====================
+# In PySpark, temp tables are automatically cleaned up when session ends
+# But you can explicitly unpersist cached DataFrames
+df_queue_filters.unpersist()
+df_forecast_requirement.unpersist()
+df_forecast_queue.unpersist()
+df_forecast_volume.unpersist()
+df_required.unpersist()
+df_erlang_required.unpersist()
+
+print("Processing complete!")
