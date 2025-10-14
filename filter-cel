@@ -1,0 +1,163 @@
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from datetime import datetime, date
+
+# Initialize Spark Session
+spark = SparkSession.builder.appName("QueueFilterHistory").getOrCreate()
+
+# Get current datetime and date
+now = datetime.now()
+today = date.today()
+
+# Read source tables
+# Assuming these are Delta tables or parquet files
+df_queue_filters = spark.table("verintwfm_queue_filters")
+df_queue = spark.table("verintwfm_queue")
+
+# Create staging dataframe (equivalent to temp table)
+df_staging = df_queue_filters.alias("qf") \
+    .join(
+        df_queue.alias("q"),
+        F.col("qf.QueueID") == F.col("q.QueueID"),
+        "left"
+    ) \
+    .select(
+        F.col("qf.FilterID"),
+        F.col("qf.FilterName"),
+        F.col("qf.ViewID"),
+        F.col("qf.ViewName"),
+        F.col("qf.QueueID"),
+        F.col("q.QueueName")
+    )
+
+# Read history table
+df_history = spark.table("verintwfm_queue_filters_history")
+
+# Filter for current active records (not terminated)
+df_history_active = df_history.filter(F.col("RecordEndDateNonInclusive") == "9999-12-31")
+
+# ===== 1. TERM EXISTING ROWS WITH NO CURRENT ALIGNMENT =====
+# Find records in history that don't exist in staging (to be terminated)
+df_to_term = df_history_active.alias("f") \
+    .join(
+        df_staging.alias("s"),
+        (F.col("f.FilterID") == F.col("s.FilterID")) &
+        (F.col("f.ViewID") == F.col("s.ViewID")) &
+        (F.col("f.QueueID") == F.col("s.QueueID")),
+        "left"
+    ) \
+    .filter(F.col("s.QueueID").isNull()) \
+    .select("f.*")
+
+# Update terminated records
+df_history_updated = df_history.alias("h") \
+    .join(
+        df_to_term.select("FilterID", "ViewID", "QueueID").alias("t"),
+        (F.col("h.FilterID") == F.col("t.FilterID")) &
+        (F.col("h.ViewID") == F.col("t.ViewID")) &
+        (F.col("h.QueueID") == F.col("t.QueueID")) &
+        (F.col("h.RecordEndDateNonInclusive") == "9999-12-31"),
+        "left"
+    ) \
+    .select(
+        F.col("h.*"),
+        F.when(F.col("t.FilterID").isNotNull(), F.lit(today)).otherwise(F.col("h.RecordEndDateTimeInclusive")).alias("new_RecordEndDateTimeInclusive"),
+        F.when(F.col("t.FilterID").isNotNull(), F.lit(now)).otherwise(F.col("h.RecordLastModifiedDateTime")).alias("new_RecordLastModifiedDateTime")
+    ) \
+    .drop("RecordEndDateTimeInclusive", "RecordLastModifiedDateTime") \
+    .withColumnRenamed("new_RecordEndDateTimeInclusive", "RecordEndDateTimeInclusive") \
+    .withColumnRenamed("new_RecordLastModifiedDateTime", "RecordLastModifiedDateTime")
+
+# ===== 2. UPDATE NON-TEMPORAL ATTRIBUTES =====
+# Find matching records with changed attributes
+df_history_active_refresh = df_history_updated.filter(F.col("RecordEndDateNonInclusive") == "9999-12-31")
+
+df_history_final = df_history_updated.alias("h") \
+    .join(
+        df_staging.alias("s"),
+        (F.col("h.FilterID") == F.col("s.FilterID")) &
+        (F.col("h.ViewID") == F.col("s.ViewID")) &
+        (F.col("h.QueueID") == F.col("s.QueueID")) &
+        (F.col("h.RecordEndDateNonInclusive") == "9999-12-31"),
+        "left"
+    ) \
+    .select(
+        F.col("h.*"),
+        F.when(
+            F.col("s.FilterID").isNotNull() &
+            (
+                (F.col("h.FilterName") != F.col("s.FilterName")) |
+                (F.col("h.ViewName") != F.col("s.ViewName")) |
+                (F.coalesce(F.col("h.QueueName"), F.lit("")) != F.coalesce(F.col("s.QueueName"), F.lit("")))
+            ),
+            F.col("s.FilterName")
+        ).otherwise(F.col("h.FilterName")).alias("new_FilterName"),
+        F.when(
+            F.col("s.FilterID").isNotNull() &
+            (
+                (F.col("h.FilterName") != F.col("s.FilterName")) |
+                (F.col("h.ViewName") != F.col("s.ViewName")) |
+                (F.coalesce(F.col("h.QueueName"), F.lit("")) != F.coalesce(F.col("s.QueueName"), F.lit("")))
+            ),
+            F.col("s.ViewName")
+        ).otherwise(F.col("h.ViewName")).alias("new_ViewName"),
+        F.when(
+            F.col("s.FilterID").isNotNull() &
+            (
+                (F.col("h.FilterName") != F.col("s.FilterName")) |
+                (F.col("h.ViewName") != F.col("s.ViewName")) |
+                (F.coalesce(F.col("h.QueueName"), F.lit("")) != F.coalesce(F.col("s.QueueName"), F.lit("")))
+            ),
+            F.col("s.QueueName")
+        ).otherwise(F.col("h.QueueName")).alias("new_QueueName")
+    ) \
+    .drop("FilterName", "ViewName", "QueueName") \
+    .withColumnRenamed("new_FilterName", "FilterName") \
+    .withColumnRenamed("new_ViewName", "ViewName") \
+    .withColumnRenamed("new_QueueName", "QueueName")
+
+# ===== 3. INSERT NEW ROWS =====
+# Find new records that don't exist in history
+df_new_records = df_staging.alias("s") \
+    .join(
+        df_history_final.filter(F.col("RecordEndDateNonInclusive") == "9999-12-31").alias("f"),
+        (F.col("s.FilterID") == F.col("f.FilterID")) &
+        (F.col("s.ViewID") == F.col("f.ViewID")) &
+        (F.col("s.QueueID") == F.col("f.QueueID")),
+        "left_anti"
+    ) \
+    .select(
+        F.col("FilterID"),
+        F.col("FilterName"),
+        F.col("ViewID"),
+        F.col("ViewName"),
+        F.col("QueueID"),
+        F.col("QueueName"),
+        F.lit(today).alias("RecordStartDateInclusive"),
+        F.lit("9999-12-31").alias("RecordEndDateTimeInclusive"),
+        F.lit(now).alias("RecordCreatedDateTime"),
+        F.lit(now).alias("RecordLastModifiedDateTime")
+    )
+
+# Combine updated history with new records
+df_result = df_history_final.unionByName(df_new_records, allowMissingColumns=True)
+
+# Write back to table (using Delta Lake merge or overwrite)
+# Option 1: Overwrite entire table
+df_result.write.mode("overwrite").saveAsTable("verintwfm_queue_filters_history")
+
+# Option 2: Using Delta Lake MERGE (preferred for production)
+# from delta.tables import DeltaTable
+# 
+# delta_table = DeltaTable.forName(spark, "verintwfm_queue_filters_history")
+# delta_table.alias("target").merge(
+#     df_result.alias("source"),
+#     "target.RecordID = source.RecordID"  # Assuming RecordID is primary key
+# ).whenMatchedUpdateAll() \
+#  .whenNotMatchedInsertAll() \
+#  .execute()
+
+print(f"Queue filter history updated successfully at {now}")
+print(f"Records terminated: {df_to_term.count()}")
+print(f"New records inserted: {df_new_records.count()}")
