@@ -1,0 +1,102 @@
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder \
+    .appName("queue_filters_history_upsert") \
+    .getOrCreate()
+
+# -- source tables (adjust if you must read via JDBC)
+# If tables are in the metastore/catalog:
+stg_qf = spark.table("dbo.verintwfm_queue_filters")   # staging source qf (qf)
+q = spark.table("dbo.verintwfm_queue")               # queue master (q)
+
+# If you need JDBC, replace above with spark.read.format("jdbc").options(...).load()
+
+# Build staging DataFrame equivalent to the temp #t_verintwfm_queue_filters
+staging = stg_qf.alias("qf") \
+    .join(q.alias("q"), F.col("qf.QueueID") == F.col("q.QueueID"), "left") \
+    .select(
+        F.col("qf.FilterID").cast("int"),
+        F.col("qf.FilterName"),
+        F.col("qf.ViewID").cast("int"),
+        F.col("qf.ViewName"),
+        F.col("qf.QueueID"),
+        F.col("q.QueueName")
+    ) \
+    .dropDuplicates(["FilterID", "ViewID", "QueueID"])  # mirrors uniqueness implied by the SQL
+
+# timestamps / dates used in SQL
+now_ts = F.current_timestamp()
+today_dt = F.current_date()
+
+# Path or table name of history (Delta)
+history_table = "dbo.verintwfm_queue_filters_history_delta"  # adjust to your actual Delta table name / path
+
+# If the history is already a Delta table:
+delta_table = DeltaTable.forName(spark, history_table)
+
+# Prepare staging as alias 's'
+s = staging.alias("s")
+f = delta_table.toDF().alias("f")
+
+# MERGE logic:
+# 1) When matched & f.RecordEndDateNonInclusive = '9999-12-31' AND s.QueueID IS NULL in staging -> set termination (set RecordEndDateTimeInclusive = today, RecordLastModifiedDateTime = now)
+#    BUT SQL determines termination by LEFT JOIN where staging has no matching row. With MERGE we will handle termination by
+#    detecting existing history rows that have no corresponding staging row (we can do this by merging on keys and using NOT MATCHED BY SOURCE)
+#
+# 2) When matched and non-temporal attributes differ -> update those attrs and set last modified
+#
+# 3) When not matched -> insert new history row with RecordStartDateInclusive = today, RecordEndDateTimeInclusive = '9999-12-31', created/last modified now
+
+# We'll use merge with:
+# - matched -> update attributes when they differ
+# - not matched -> insert
+# - not matched by source -> update end date (terminate)
+
+# Helper expression to check attribute difference (SQL used != and ISNULL comparisons)
+attr_diff_cond = (
+    (F.col("f.FilterName") != F.col("s.FilterName")) |
+    (F.col("f.ViewName") != F.col("s.ViewName")) |
+    (F.coalesce(F.col("f.QueueName"), F.lit("")) != F.coalesce(F.col("s.QueueName"), F.lit("")))
+)
+
+# Perform MERGE
+(delta_table.alias("f")
+ .merge(
+     source = s,
+     condition = "f.FilterID = s.FilterID AND f.ViewID = s.ViewID AND f.QueueID = s.QueueID"
+ )
+ .whenMatchedUpdate(
+     condition = "f.RecordEndDateNonInclusive = '9999-12-31' AND (" + attr_diff_cond._jc.toString() + ")",
+     set = {
+         "FilterName": "s.FilterName",
+         "ViewName": "s.ViewName",
+         "QueueName": "s.QueueName",
+         "RecordLastModifiedDateTime": "current_timestamp()"
+     }
+ )
+ # Terminate existing rows that no longer have a matching staging row
+ .whenNotMatchedBySourceUpdate(
+     condition = "f.RecordEndDateNonInclusive = '9999-12-31'",
+     set = {
+         "RecordEndDateTimeInclusive": "current_date()",
+         "RecordLastModifiedDateTime": "current_timestamp()"
+     }
+ )
+ .whenNotMatchedInsert(
+     values = {
+         "FilterID": "s.FilterID",
+         "FilterName": "s.FilterName",
+         "ViewID": "s.ViewID",
+         "ViewName": "s.ViewName",
+         "QueueID": "s.QueueID",
+         "QueueName": "s.QueueName",
+         "RecordStartDateInclusive": "current_date()",
+         "RecordEndDateTimeInclusive": "'9999-12-31'",
+         "RecordCreatedDateTime": "current_timestamp()",
+         "RecordLastModifiedDateTime": "current_timestamp()"
+     }
+ )
+ .execute()
+)
