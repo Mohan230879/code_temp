@@ -1,0 +1,206 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, when, isnull, coalesce, lit, sum as _sum, max as _max,
+    minute, date_add, current_timestamp
+)
+from pyspark.sql.window import Window
+from datetime import datetime, timedelta
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("VerintWFM ETL") \
+    .getOrCreate()
+
+# =========================================
+# Step 1: Prepare Stage Data
+# =========================================
+
+# Read source data (adjust path and format as needed)
+qhts_df = spark.table("dbo.QUEUEHISTORYMEASURE")
+
+# Define date range
+start_date = "2022-09-24"
+end_date = "2022-09-28"
+
+# Process the data similar to CTE R
+r_df = qhts_df.filter(
+    (col("TIME") >= start_date) & (col("TIME") < end_date)
+).select(
+    col("TIME").alias("BaseDateTime"),
+    col("QUEUEID"),
+    when(col("AHT") == -2147483648, 0).otherwise(coalesce(col("AHT"), lit(0))).alias("AHT"),
+    when(col("CALLVOLUME") == -2147483648, 0).otherwise(coalesce(col("CALLVOLUME"), lit(0))).alias("CALLVOLUME"),
+    when(col("ASA") == -2147483648, 0).otherwise(coalesce(col("ASA"), lit(0))).alias("ASA"),
+    when(col("SERVICELEVEL") == -2147483648, 0).otherwise(coalesce(col("SERVICELEVEL"), lit(0))).alias("SERVICELEVEL"),
+    when(col("STAFFING") == -2147483648, 0).otherwise(coalesce(col("STAFFING"), lit(0))).alias("STAFFING"),
+    when(col("OCCUPANCY") == -2147483648, 0).otherwise(coalesce(col("OCCUPANCY"), lit(0))).alias("OCCUPANCY"),
+    when(col("ABANDONS") == -2147483648, 0).otherwise(coalesce(col("ABANDONS"), lit(0))).alias("ABANDONS"),
+    when(col("BACKLOG") == -2147483648, 0).otherwise(coalesce(col("BACKLOG"), lit(0))).alias("BACKLOG"),
+    when(col("FTE") == -2147483648, 0).otherwise(coalesce(col("FTE"), lit(0))).alias("FTE"),
+    when(col("CONNECTS") == -2147483648, 0).otherwise(coalesce(col("CONNECTS"), lit(0))).alias("CONNECTS"),
+    when(col("RPC") == -2147483648, 0).otherwise(coalesce(col("RPC"), lit(0))).alias("RPC"),
+    when(col("RPCAHT") == -2147483648, 0).otherwise(coalesce(col("RPCAHT"), lit(0))).alias("RPCAHT"),
+    when(col("DIALS") == -2147483648, 0).otherwise(coalesce(col("DIALS"), lit(0))).alias("DIALS"),
+    when(col("VH") == -2147483648, 0).otherwise(coalesce(col("VH"), lit(0))).alias("VH")
+)
+
+# Add adjusted DateTime column (handling 15 and 45 minute intervals)
+r_df = r_df.withColumn(
+    "DateTime",
+    when(minute(col("BaseDateTime")).isin([15, 45]),
+         date_add(col("BaseDateTime"), -15/1440))  # Subtract 15 minutes
+    .otherwise(col("BaseDateTime"))
+)
+
+# Group by DateTime and QueueID
+stage_df = r_df.groupBy("DateTime", "QUEUEID").agg(
+    _max("AHT").alias("AHT"),
+    _sum("CALLVOLUME").alias("CALLVOLUME"),
+    _max("ASA").alias("ASA"),
+    _max("SERVICELEVEL").alias("SERVICELEVEL"),
+    _max("STAFFING").alias("STAFFING"),
+    _max("OCCUPANCY").alias("OCCUPANCY"),
+    _sum("ABANDONS").alias("ABANDONS"),
+    _sum("BACKLOG").alias("BACKLOG"),
+    _sum("FTE").alias("FTE"),
+    _sum("CONNECTS").alias("CONNECTS"),
+    _max("RPC").alias("RPC"),
+    _max("RPCAHT").alias("RPCAHT"),
+    _sum("DIALS").alias("DIALS"),
+    _max("VH").alias("VH")
+)
+
+# Apply HAVING filter (exclude rows where all summed/aggregated values are 0)
+stage_df = stage_df.filter(
+    ~(
+        (col("CALLVOLUME") == 0) &
+        (col("ABANDONS") == 0) &
+        (col("STAFFING") == 0) &
+        (col("BACKLOG") == 0) &
+        (col("FTE") == 0) &
+        (col("RPC") == 0) &
+        (col("DIALS") == 0) &
+        (col("VH") == 0)
+    )
+)
+
+# Write to staging table
+stage_df.write.mode("overwrite").saveAsTable("dbo.verintwfm_stage_results")
+
+# =========================================
+# Step 2 & 3: Synchronize Target Table
+# =========================================
+
+# Read stage and target tables
+stage_df = spark.table("dbo.verintwfm_stage_results")
+target_df = spark.table("dbo.verintwfm_results")
+
+# Get current timestamp
+now = current_timestamp()
+
+# Get date range from stage data
+stage_min_date = stage_df.agg({"DateTime": "min"}).collect()[0][0]
+stage_max_date = stage_df.agg({"DateTime": "max"}).collect()[0][0]
+
+# Step 2a: Identify records to delete (exist in target but not in stage within date range)
+target_in_range = target_df.filter(
+    (col("DateTime") >= stage_min_date) & (col("DateTime") <= stage_max_date)
+)
+
+records_to_keep = target_in_range.join(
+    stage_df,
+    on=["DateTime", "QUEUEID"],
+    how="left_anti"  # Records in target but not in stage
+)
+
+# Keep records outside the date range and records that exist in stage
+target_df = target_df.filter(
+    (col("DateTime") < stage_min_date) | (col("DateTime") > stage_max_date)
+).union(
+    target_in_range.join(stage_df, on=["DateTime", "QUEUEID"], how="inner").select(target_df.columns)
+)
+
+# Step 2b: Update existing records
+updated_records = target_df.alias("f").join(
+    stage_df.alias("s"),
+    on=["DateTime", "QUEUEID"],
+    how="inner"
+).filter(
+    (coalesce(col("f.AHT"), lit(0)) != coalesce(col("s.AHT"), lit(0))) |
+    (coalesce(col("f.CALLVOLUME"), lit(0)) != coalesce(col("s.CALLVOLUME"), lit(0))) |
+    (coalesce(col("f.ASA"), lit(0)) != coalesce(col("s.ASA"), lit(0))) |
+    (coalesce(col("f.SERVICELEVEL"), lit(1)) != coalesce(col("s.SERVICELEVEL"), lit(1))) |
+    (coalesce(col("f.STAFFING"), lit(0)) != coalesce(col("s.STAFFING"), lit(0))) |
+    (coalesce(col("f.OCCUPANCY"), lit(0)) != coalesce(col("s.OCCUPANCY"), lit(0))) |
+    (coalesce(col("f.ABANDONS"), lit(0)) != coalesce(col("s.ABANDONS"), lit(0))) |
+    (coalesce(col("f.BACKLOG"), lit(0)) != coalesce(col("s.BACKLOG"), lit(0))) |
+    (coalesce(col("f.FTE"), lit(0)) != coalesce(col("s.FTE"), lit(0))) |
+    (coalesce(col("f.CONNECTS"), lit(0)) != coalesce(col("s.CONNECTS"), lit(0))) |
+    (coalesce(col("f.RPC"), lit(0)) != coalesce(col("s.RPC"), lit(0))) |
+    (coalesce(col("f.RPCAHT"), lit(0)) != coalesce(col("s.RPCAHT"), lit(0))) |
+    (coalesce(col("f.DIALS"), lit(0)) != coalesce(col("s.DIALS"), lit(0))) |
+    (coalesce(col("f.VH"), lit(0)) != coalesce(col("s.VH"), lit(0)))
+).select(
+    col("s.DateTime"),
+    col("s.QUEUEID"),
+    col("s.AHT"),
+    col("s.CALLVOLUME"),
+    col("s.ASA"),
+    col("s.SERVICELEVEL"),
+    col("s.STAFFING"),
+    col("s.OCCUPANCY"),
+    col("s.ABANDONS"),
+    col("s.BACKLOG"),
+    col("s.FTE"),
+    col("s.CONNECTS"),
+    col("s.RPC"),
+    col("s.RPCAHT"),
+    col("s.DIALS"),
+    col("s.VH"),
+    col("f.RecordCreatedDateTime"),
+    now.alias("RecordLastModifiedDateTime")
+)
+
+# Remove old versions of updated records from target
+target_df = target_df.join(
+    updated_records.select("DateTime", "QUEUEID"),
+    on=["DateTime", "QUEUEID"],
+    how="left_anti"
+)
+
+# Add updated records
+target_df = target_df.union(updated_records)
+
+# Step 3: Insert new records
+new_records = stage_df.join(
+    target_df,
+    on=["DateTime", "QUEUEID"],
+    how="left_anti"
+).select(
+    col("DateTime"),
+    col("QUEUEID"),
+    col("AHT"),
+    col("CALLVOLUME"),
+    col("ASA"),
+    col("SERVICELEVEL"),
+    col("STAFFING"),
+    col("OCCUPANCY"),
+    col("ABANDONS"),
+    col("BACKLOG"),
+    col("FTE"),
+    col("CONNECTS"),
+    col("RPC"),
+    col("RPCAHT"),
+    col("DIALS"),
+    col("VH"),
+    now.alias("RecordCreatedDateTime"),
+    now.alias("RecordLastModifiedDateTime")
+)
+
+# Add new records to target
+final_df = target_df.union(new_records)
+
+# Write final result back to target table
+final_df.write.mode("overwrite").saveAsTable("dbo.verintwfm_results")
+
+print("ETL process completed successfully!")
